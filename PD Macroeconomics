@@ -1,0 +1,458 @@
+/* *******************************************************************  */
+/*        This is a script that explores PD calculations                */
+/*        Done by Taipa                                                 */
+/*        November 2024                                                 */
+/*        Methods 1) Logistic  Regression                                         */
+/********************************************************************** */
+/* ******************************************************************** */
+Options validvarname=V7 MSGLEVEL=I mlogic mprint mcompilenote = all;
+
+/* assigning libraries */
+libname pd base '/home/u49308301/Research/Course';
+%let path = %sysfunc(pathname(pd));
+%put &path;
+
+/* Importing the dataset metadata and using it as labels */
+FILENAME Meta "/home/u49308301/Research/Course/MetaData.xlsx";
+
+PROC IMPORT datafile=Meta replace dbms=xlsx out=meta;
+	getnames=Yes;
+RUN;
+
+/* Importing Macroeconomic data file where the data is available publicly on the internet*/
+FILENAME Macro "/home/u49308301/Research/PD/MacroEconomic.xlsx";
+
+PROC IMPORT datafile=Macro replace dbms=xlsx out=MacroEc;
+	getnames=Yes;
+RUN;
+
+/* Putting labels on the macroeconomic file */
+data MacroEc;
+	set MacroEc;
+	label 
+		Unemployment='Unemployment rate (aged 16 and over, seasonally adjusted): %' 
+		GDP='Gross Domestic Product: Year on Year growth: CVM SA %' 
+		Inflation='CPI ANNUAL RATE 00: ALL ITEMS 2015=100' LIBOR='LIBOR';
+run;
+
+/* Putting variable labels and dropping all identifier columns NOT used for modeling */
+
+
+Proc sql noprint;
+	select Label into :mylabel separated by " " from Meta;
+quit;
+
+%put &mylabel;
+
+DATA Wholesale;
+	* (DROP=obs_id);
+	SET pd.Wholesale;
+	label &myLabel;
+run;
+
+/* Mapping the Macroeconomic variables to the Wholesale Financial data set */
+data Wholesale;
+	if 0 then
+		set work.MacroEc;
+
+	if _n_=1 then
+		do;
+
+			if 0 then
+				set work.MacroEc;
+			declare Hash Ecos(dataset:'work.MacroEc (where =(Year>=1989))');
+			Ecos.DefineKey('Year');
+			Ecos.DefineData('Unemployment', 'GDP', 'Inflation', 'LIBOR');
+			Ecos.DefineDone();
+		end;
+	SET wholesale;
+	rc=Ecos.find(key:Year);
+
+	if rc ne 0 then
+		call missing(Unemployment, GDP, Inflation, LIBOR);
+	output Wholesale;
+
+run;
+
+
+/* Establish a macro variable for the list of numerical inputs */
+proc contents data = Wholesale OUT=cols ORDER=varnum noprint ;
+RUN;
+%global inputs;
+proc sql noprint;
+select name into:inputs separated by " " from cols  
+where name not in ('rc','obs_ib','default','obs_id','testing_set','training_set') ;
+run;
+
+%put &=inputs;
+
+/* Changing the class variable from character string to numeric */
+data Wholesale;
+	set Wholesale (rename=(class=class1));
+	class=input(compress(class1), BEST5.);
+	drop class1;
+run;
+
+proc contents data = Wholesale OUT=cols ORDER=varnum  noprint;
+RUN;
+
+/* Investigate the distribution of the numeric inputs  */
+TITLE "Investigate the distribution of the numeric inputs" ;
+PROC MEANS DATA=work.Wholesale n nmiss mean min max;
+var &inputs;
+RUN;
+TITLE;
+
+/* Working with category inputs "class" variable - reducing the levels
+which leads to high dimensionality and quasi-complete separation*/
+
+/* Looking at this frequence distribution table you can see that when class= "1547" with zero events leads to quasi-complete separation */
+proc freq data= wholesale ;
+TABLES default CLASS*default YEAR*DEFAULT;
+RUN; 
+
+/* Sorting the data before using stratified sampling  */
+proc sort data = wholesale out = wholesale;
+by default;
+RUN;
+
+/* Splitting the dataset into training and holdout sample dataset */
+
+proc surveyselect data = wholesale samprate=.7 seed= 1234 out= wholesale outall;
+STRATA default;
+RUN;
+
+/* verify stratification  */
+proc freq data = work.wholesale;
+tables default*selected;
+run;
+
+/* Creating training and validation datasets */
+
+data work.train(drop= selected) work.test(drop = selected); 
+set wholesale;
+if selected then output work.train;
+else output work.test;
+drop SelectionProb SamplingWeight rc obs_id training_set testing_set;
+run;
+
+%PUT &INPUTS;
+
+/* The code shows that the class variable has quasi-complete separation where the target event rate is 0% the logit = -ve infinite; */
+proc means data=work.train noprint nway;
+	class class;
+	var default;
+	output out=work.level mean=prop;
+run;
+
+proc print data=work.level;
+Run;
+
+/* Rho is the proportion of events in the  training data set  */
+%global rho1;
+
+proc sql noprint;
+	select mean(default) into : rho1 from work.train;
+quit;
+
+/* The output data set from PROC MEANS will have the number of
+observations and events for each level of class*/
+PROC MEANS data=work.train sum nway noprint;
+	class class;
+	var default;
+	output out=work.counts sum=events;
+run;
+
+
+/* The data step creates the scoring code that assigns each branch
+to a value of the smoothed weight of evidence */
+
+/* converting the categorical variable to a continuous variable */
+
+filename deswoe"/home/u49308301/Research/PD/swoe_default.sas";
+
+data _null_;
+	file deswoe;
+	set work.counts end=last;
+	logit=log((events + &rho1.*24)/(_FREQ_ - events + (1-&rho1.)*24));
+
+	if _n_=1 then
+		put "select (class) ;";
+	put "when ('" class +(-1) "') class_swoe =" logit ";";
+
+	if last then
+		do;
+			logit=log(&rho1/(1-&rho1));
+			put " otherwise class_swoe = " logit ";"/"end;";
+		end;
+RUN;
+
+DATA work.train_swoe(Drop=class);
+retain class_swoe;
+	set work.train;
+	%include deswoe / source2;
+run;
+
+PROC CONTENTS DATA=work.train_swoe;
+RUN;
+
+proc freq data=work.train_swoe;
+	tables class_swoe;
+run;
+
+/* Reducing redundancy by using clustering based on the Principal component analysis */
+/* Use the ODS OUTPUT statement to generate data sets based on the
+variable clustering results and the clustering summary */
+/*  using 1 - R^2 ratio and subject knowledge */
+ods select none;
+ods output clusterquality=work.summary rsquare=work.clusters;
+
+proc varclus data=work.train_swoe maxeigen=0.7 hi;
+	var x1--x25 class_swoe;
+run;
+
+
+ods select all;
+
+/* Use the CALL SYMPUT function to create a macro variable : &NVAR = the number of clusters. tHis also the nmber of variables in the analysis  */
+/* , going forward */
+%global nvar;
+
+data _null_;
+	set work.summary;
+	call symput ('nvar', compress(NumberOfClusters));
+RUN;
+
+TITLE "Variables by Cluster";
+
+proc print data=work.clusters noobs label split='*';
+	where NumberOfClusters=&nvar;
+	var Cluster Variable RSquareRatio VariableLabel;
+	label RSquareRatio="1 - RSquare * Ratio";
+RUN;
+
+title;
+title "Variation Explained by Clusters";
+
+proc print data=work.summary label;
+run;
+
+data clusters;
+	set work.clusters;
+	where NumberOfClusters=&nvar;
+run;
+
+/* Chose a representative from each cluster */
+
+%global reduced;
+%let reduced =  Year Time Unemployment GDP Inflation LIBOR x6 x10 x9 x14 x20 x4 x18 x8 x17 x3 class_swoe x22 x2 x23 x11 x5 x1;
+
+/* Analysis descriptive statistics of the data */
+PROC MEANS DATA=sample_swoe;
+	var &reduced;
+RUN;
+
+PROC FREQ DATA=sample_swoe;
+	tables time default training_set testing_set;
+RUN;
+
+/* Variable screening  */
+ods select none;
+ods output spearmancorr=work.spearman hoeffdingcorr=work.hoeffding;
+
+proc corr data=work.train_swoe spearman hoeffding;
+	var default;
+	with &reduced;
+run;
+
+ods select all;
+
+proc sort data=work.spearman;
+	by variable;
+run;
+
+proc sort data=work.Hoeffding;
+	by variable;
+run;
+
+data work.correlations;
+	merge work.spearman(rename=(default=scorr pdefault=spvalue)) 
+		work.Hoeffding(rename=(default=hcorr pdefault=hpvalue));
+	by variable;
+	scorr_abs=abs(scorr);
+	hcorr_abs=abs(hcorr);
+run;
+
+PROC RANK DATA=WORK.correlations out=work.correlations1 descending;
+	var scorr_abs hcorr_abs;
+	ranks ranksp ranko;
+run;
+
+proc sort data=correlations1;
+	by ranksp;
+run;
+
+title "Rank of Separman Correlations and Hoeffding Correlations";
+
+proc print data=work.correlations1 label split='*';
+	var variable ranksp ranko scorr spvalue hcorr hpvalue;
+	label ranksp='Spearman rank * of variables' scorr="Spearman Correlation" 
+		spvalue="Spearman p-value" ranko="Hoeffding rank * of variables" 
+		hcorr="Hoeffding Correlation" hpvalue="Hoeffding p-value";
+run;
+
+/* Find values for reference lines */
+
+%global vref href;
+
+proc sql;
+	select min(ranksp) into :vref from (select ranksp from work.correlations1 
+		having spvalue > .05);
+	* VAlue idecreased from .5 to .05;
+	select min(ranko) into :href from (select ranko from work.correlations1 having 
+		hpvalue > .5);
+quit;
+
+%put &vref;
+
+/* Plot variable names, Hoeffding ranks, and  Spearman ranks. *//*No varibale was screened*/
+title1 "Scatter Plot of Ranks of Spearman vs. Hoeffding";
+
+proc sgplot data=work.correlations1;
+	refline &vref / axis=y;
+	refline &href / axis=x;
+	scatter y=ranksp x=ranko / datalabel=variable;
+	yaxis label="Rank of Spearman";
+	xaxis label="Rank of Hoeffding";
+RUN;
+
+TITLE1;
+
+/* Group the data by the variable of interest in order to create empirical logit plots. */
+
+%global;
+%let var = x6;
+
+proc rank data=work.train_swoe groups=100 out=work.ranks;
+	var &var;
+	ranks bin;
+run;
+
+title "x6 by Bin";
+
+proc print data=work.ranks;
+	VAR &VAR BIN;
+RUN;
+
+PROC MEANS DATA=work.ranks noprint nway;
+	class bin;
+	var default &var;
+	output out=work.bins sum(default)=default mean(&var)=&var;
+run;
+
+title "Number of Observations ";
+
+proc print data=work.bins (obs=10);
+run;
+
+/* Calculate the empirical logit */
+data work.bins;
+	set work.bins;
+	elogit=log((default+(sqrt(_FREQ_)/2))/(_FREQ_ - default+(sqrt(_FREQ_)/2)));
+run;
+
+title "empirical Logit against &var";
+
+proc sgplot data=work.bins;
+	reg y=elogit x=&var / curvelabel="Linear Relationship" curvelabelloc=outside 
+		lineattrs=(color=ligr);
+	series y=elogit x=&var;
+RUN;
+
+TITLE1 "Empirical Logit against Binned &var";
+
+proc sgplot data=work.bins;
+	reg y=elogit x=bin / curvelabel="Linear Relationship" curvelabelloc=outside 
+		lineattrs=(color=ligr);
+	series y=elogit x=bin;
+run;
+
+/* stratified random sampling to the split training and validation datasets */
+proc sort data=sample_swoe out=work.wholesale_sort(drop=training_set 
+		testing_set);
+	by default;
+RUN;
+
+PROC SURVEYSELECT noprint data=work.wholesale_sort out=wholesale_sample 
+		samprate=.7 seed=1234 outall;
+	strata default;
+run;
+
+/* verify stratification */
+proc freq data=wholesale_sample;
+	tables default*selected/ nocum nopercent;
+run;
+
+/* dropping unwanted columns produced by the surveyselect procedure */
+data train (drop=selected SelectionProb SamplingWeight) test (drop=selected 
+		SelectionProb SamplingWeight);
+	set wholesale_sample;
+
+	if selected=1 then
+		output train;
+	else
+		output test;
+run;
+
+%LET vars = x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20 x21 x22 x23 x24 x25 x26 time ;
+
+/* specifying the prior probabilities to correct oversampling */
+%global pi1;
+%let pi1 = .04;
+
+/* Correct predicted probabilities */
+/* Training the logistic regression  */
+title " Logistic Regression Model for the Wholesale Default dataset";
+
+proc logistic data=train plots(only maxpoints=none)=(effect(clband x=(&vars.)) 
+		oddsratio (type=horizontalstat));
+	class x26 (param=ref ref='1');
+	model default (event='1')=&vars./stb clodds=pl;
+	score data=work.test out=work.scored3 priorevent=&pi1;
+
+	/* method used for outputing data file for the scoring code*/
+	/* 	code file="&path/score2.txt"; */
+	/* method used for keeping the script that scores the data*/
+	units time=10 / default=1;
+	oddsratio 'comparisons of default rates ' x26/ diff=all cl=pl;
+	effectplot slicefit (sliceby=x26 x=x1)/noobs;
+	effectplot slicefit (sliceby=x26 x=x2)/noobs;
+RUN;
+
+TITLE;
+
+/*
+data work.scored3;
+set work.test;
+%include "&path/score2.txt";
+run;
+*/
+/* printing the Scored data of the model  10 obs */
+title1 "Predicted probabilities from Scored Dataset";
+
+proc print data=work.scored3 (obs=10);
+	var p_1 &vars;
+run;
+
+title1 "Mean of Predicted Probabilities from Scored data set";
+
+proc contents data=work.scored3;
+run;
+
+proc means data=work.scored3 mean;
+	var p_1;
+run;
+
+PROC FREQ DATA=work.train_swoe;
+	TABLE year;
+run;
